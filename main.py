@@ -3,12 +3,17 @@ import os
 import struct
 import zipfile
 import shutil
+import json
+import io
 import sys
 import threading
 
 # 常量定义
 CHUNK_SIZE = 4 * 1024 * 1024  # 4MB，适合处理 1-2GB 大文件
 HIDE_BOX_TYPE = b'hide'
+ZIP_LOCAL_SIG = b"PK\x03\x04"   # local file header
+ZIP_EOCD_SIG = b"PK\x05\x06"    # End of Central Directory
+EOCD_FIXED_SIZE = 22
 
 class StegoApi:
     def __init__(self):
@@ -21,33 +26,46 @@ class StegoApi:
     def log(self, msg):
         """推送日志到前端"""
         # 替换单引号，防止 JS 语法错误
-        safe_msg = str(msg).replace("'", "\\'")
-        self._window.evaluate_js(f"addLog('{safe_msg}')")
+        #safe_msg = str(msg).replace("'", "\\'")
+        #self._window.evaluate_js(f"addLog('{safe_msg}')")
+        safe_msg = json.dumps(msg, ensure_ascii=False)
+        self._window.evaluate_js(f"addLog({safe_msg})")
 
     def progress(self, percent):
         """推送进度条到前端"""
         self._window.evaluate_js(f"updateProgress({percent})")
 
-    def remove_double_quotes(self, text):
-        if text[0] and text[-1] == r'"':
-            text=text[1:-1]
+    def remove_outer_quotes(self, text):
+        text = str(text).strip()
+
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+            text = text[1:-1]
+
+        if os.path.isdir(text)==False and os.path.isfile(text)==False:
+            self.log(f"{text} #File Path is NOT Compliant")
+
         return text
 
     def select_file(self):
-        result = self._window.create_file_dialog(webview.OPEN_DIALOG)
-        #print(result,type(result),type(result[0]))
-        result=list(result)
-        #print(result, type(result), type(result[0]))
-        result[0]=self.remove_double_quotes(result[0])
-        return result[0] if result else None
+        try:
+            result = self._window.create_file_dialog(webview.FileDialog.OPEN)
+            #print(result,type(result),type(result[0]))
+            result=list(result)
+            #print(result, type(result), type(result[0]))
+            result[0]=self.remove_outer_quotes(result[0])
+            return result[0] if result else None
+        except:
+            return None
 
     def select_folder(self):
-        result = self._window.create_file_dialog(webview.FOLDER_DIALOG)
-        #print(result,type(result),type(result[0]))
-        result=list(result)
-        result[0] = self.remove_double_quotes(result[0])
-        #print(result, type(result), type(result[0]))
-        return result[0] if result else None
+        try:
+            result = self._window.create_file_dialog(webview.FileDialog.FOLDER)
+            result=list(result)
+            result[0] = self.remove_outer_quotes(result[0])
+            return result[0] if result else None
+        except:
+            return None
+
 
     # --- 2. 核心文件处理工具 ---
     def get_unique_path(self, target_path):
@@ -107,6 +125,8 @@ class StegoApi:
                     payload_size = box_size - (payload_offset - offset)
                     boxes.append({'type': box_type, 'payload_offset': payload_offset, 'payload_size': payload_size})
                     offset += box_size
+                    if box_size < 8:
+                        break
             return boxes
         except Exception as e:
             return None # 解析失败，非有效 MP4
@@ -114,14 +134,14 @@ class StegoApi:
     def validate_shell_video(self, shell_path):
         """校验外壳视频是否有效且无 hide box"""
         if not os.path.isfile(shell_path):
-            self.log(f"<span style='color:red;'>错误：外壳视频不存在 - {shell_path}</span>")
+            self.log(f"<span style='color:red;'>Error: The shell video does not exist - {shell_path}</span>")
             return False
         boxes = self.parse_mp4_boxes(shell_path)
         if boxes is None or not any(b['type'] == b'ftyp' for b in boxes):
-            self.log(f"<span style='color:red;'>错误：该文件不是有效的 MP4 视频。</span>")
+            self.log(f"<span style='color:red;'>Error: This file is not a valid MP4 video.</span>")
             return False
         if any(b['type'] == HIDE_BOX_TYPE for b in boxes):
-            self.log(f"<span style='color:red;'>错误：此外壳视频已包含 hide box，不可二次植入。</span>")
+            self.log(f"<span style='color:red;'>Error: This embedded video already contains a hide box and cannot be embedded again.</span>")
             return False
         return True
 
@@ -144,11 +164,10 @@ class StegoApi:
 
     # --- 3. 批量植入模块 ---
     def process_batch_injection(self, shell_video, target_list, temp_dir, output_dir, include_parent):
-        #os.makedirs(temp_dir, exist_ok=True)
-        #os.makedirs(output_dir, exist_ok=True)
-        shell_video=self.remove_double_quotes(shell_video)
-        temp_dir=self.remove_double_quotes(temp_dir)
-        output_dir=self.remove_double_quotes(output_dir)
+
+        shell_video=self.remove_outer_quotes(shell_video)
+        temp_dir=self.remove_outer_quotes(temp_dir)
+        output_dir=self.remove_outer_quotes(output_dir)
         #print(shell_video,type(shell_video))
         #print(temp_dir,type(temp_dir))
         #print(output_dir, type(output_dir))
@@ -163,25 +182,35 @@ class StegoApi:
 
         for target in target_list:
             #print('165'+target,type(target))
-            target = self.remove_double_quotes(target)
+            target = self.remove_outer_quotes(target)
             if not os.path.exists(target):
-                self.log(f"警告：找不到路径跳过 - {target}")
+                self.log(f"Warning: Path not found. Skipping. - {target}")
                 continue
 
-            self.log(f"开始处理目标: {target}")
+            self.log(f"Start processing the target: {target}")
             payload_path = None
             is_temp_created = False
 
             # 逻辑1：判断是压缩包、文件还是目录
-            if os.path.isfile(target) and target.lower().endswith('.zip'):
-                if not self.is_zip_encrypted(target):
-                    self.log("检测到无密码 ZIP，直接准备植入...")
+            if os.path.isfile(target):
+                if target.lower().endswith('.zip'):
+                    if not self.is_zip_encrypted(target):
+                        self.log("A password-less ZIP file has been detected; preparing to embed it...")
+                        payload_path = target
+                    else:
+                        self.log("An encrypted ZIP file was detected; repackage it as a nested ZIP archive and then embed it...")
+                        payload_path = self.create_temp_zip(target, temp_dir, include_parent)
+                        is_temp_created = True
+
+                elif target.lower().endswith('.bin'):
+                    self.log("A BIN file has been detected; preparing to embed it...")
                     payload_path = target
                 else:
-                    self.log("检测到加密 ZIP，无需重新打包，直接植入...")
-                    payload_path = target
+                    self.log("This is not a ZIP file; creating a compressed archive in the cache directory...")
+                    payload_path = self.create_temp_zip(target, temp_dir, include_parent)
+                    is_temp_created = True
             else:
-                self.log("非 ZIP 或为目录，正在缓存目录生成压缩包...")
+                self.log("This is not a ZIP file or is a directory; creating a compressed archive in the cache directory...")
                 payload_path = self.create_temp_zip(target, temp_dir, include_parent)
                 is_temp_created = True
 
@@ -214,45 +243,54 @@ class StegoApi:
                             written += len(chunk)
                             self.progress(int(written / total_work * 100))
                             
-                self.log(f"<span style='color:lime;'>成功：植入完成 -> {out_mp4_path}</span>")
+                self.log(f"<span style='color:lime;'>Success: Embedding complete -> {out_mp4_path}</span>")
             except Exception as e:
-                self.log(f"<span style='color:red;'>合并时出错: {e}</span>")
+                self.log(f"<span style='color:red;'>An error occurred during the merge: {e}</span>")
             finally:
                 # 逻辑4：清理临时文件
                 if is_temp_created and os.path.exists(payload_path):
                     os.remove(payload_path)
 
         self.progress(100)
-        self.log("所有植入任务处理完毕！")
+        self.log("All embedding tasks have been completed!")
 
     # --- 4. 批量提取模块 ---
     def process_batch_extraction(self, target_list, output_dir):
 
         #os.makedirs(output_dir, exist_ok=True)
         # 使用缓存目录存放提取出来的 raw payload
-        output_dir=self.remove_double_quotes(output_dir)
+        output_dir=self.remove_outer_quotes(output_dir)
         if os.path.exists(output_dir)==False: os.makedirs(output_dir)
         temp_dir = os.path.abspath("./.temp")
         os.makedirs(temp_dir, exist_ok=True)
 
         for mp4_target in target_list:
-            mp4_target = self.remove_double_quotes(mp4_target)
+            mp4_target = self.remove_outer_quotes(mp4_target)
             if not os.path.isfile(mp4_target):
-                self.log(f"警告：文件不存在跳过 - {mp4_target}")
+                self.log(f"Warning: File does not exist and will be skipped - {mp4_target}")
                 continue
 
+
             self.log(f"分析视频: {mp4_target}")
+
             boxes = self.parse_mp4_boxes(mp4_target)
             if boxes is None:
-                self.log(f"<span style='color:red;'>错误：不是有效 MP4 - {mp4_target}</span>")
+                self.log(f"<span style='color:red;'>Error: Invalid MP4 file - {mp4_target}</span>")
                 continue
 
             hide_boxes = [b for b in boxes if b['type'] == HIDE_BOX_TYPE]
             if not hide_boxes:
-                self.log("未发现任何 hide box 隐藏数据。")
+                base_name = os.path.splitext(os.path.basename(mp4_target))[0]
+                zip_out = os.path.join(output_dir, f"{base_name}_extracted.zip")
+                rst = self.extract_simple_zip_from_bin(mp4_target, zip_out)
+                if rst == None:
+                    self.log("No hide boxes or hidden data were found.")
+                if type(rst) == str:
+                    self.log("The steganographic data embedded by the SteganographierGUI software has been extracted.")
+
                 continue
 
-            self.log(f"发现 {len(hide_boxes)} 个隐藏数据块，准备提取...")
+            self.log(f"{len(hide_boxes)} hidden data blocks found; preparing to extract them")
 
             with open(mp4_target, 'rb') as f_in:
                 for idx, hb in enumerate(hide_boxes):
@@ -276,14 +314,14 @@ class StegoApi:
                         # 非 ZIP，直接移动到输出目录
                         out_file = self.get_unique_path(os.path.join(output_dir, f"{base_name}_extracted.{arc_type}"))
                         shutil.move(temp_payload, out_file)
-                        self.log(f"<span style='color:lime;'>成功：分离出 {arc_type.upper()} 文件 -> {out_file}</span>")
+                        self.log(f"<span style='color:lime;'>Success: {arc_type.upper()} file extracted -> {out_file}</span>")
 
                     elif arc_type == 'zip':
                         if self.is_zip_encrypted(temp_payload):
                             # 加密 ZIP，不解压，直接输出
                             out_file = self.get_unique_path(os.path.join(output_dir, f"{base_name}_extracted.zip"))
                             shutil.move(temp_payload, out_file)
-                            self.log(f"<span style='color:lime;'>成功：分离出加密 ZIP -> {out_file}</span>")
+                            self.log(f"<span style='color:lime;'>Success: Encrypted ZIP file extracted -> {out_file}</span>")
                         else:
                             # 无密码 ZIP，解压里面内容
                             out_folder = self.get_unique_path(os.path.join(output_dir, f"{base_name}_contents"))
@@ -291,23 +329,118 @@ class StegoApi:
                             try:
                                 with zipfile.ZipFile(temp_payload, 'r') as zf:
                                     zf.extractall(out_folder)
-                                self.log(f"<span style='color:lime;'>成功：解压无密码 ZIP -> {out_folder}</span>")
+                                self.log(f"<span style='color:lime;'>Success: Unzipped the password-less ZIP file -> {out_folder}</span>")
                             except Exception as e:
-                                self.log(f"<span style='color:red;'>解压失败: {e}</span>")
+                                self.log(f"<span style='color:red;'>Extraction failed: {e}</span>")
                             finally:
                                 os.remove(temp_payload)
                     else:
                         # 未知格式，当成 raw 数据抛出
-                        out_file = self.get_unique_path(os.path.join(output_dir, f"{base_name}_unknown.dat"))
+                        out_file = self.get_unique_path(os.path.join(output_dir, f"{base_name}_unknown.bin"))
                         shutil.move(temp_payload, out_file)
                         self.log(f"警告：未知格式数据，已保存为 -> {out_file}")
 
         self.progress(100)
         self.log("所有提取任务处理完毕！")
 
+    def extract_simple_zip_from_bin(self,bin_path:str, output_path:str):
+        #ZIP_LOCAL_SIG = b"PK\x03\x04"
+        #ZIP_EOCD_SIG = b"PK\x05\x06"
+        #EOCD_FIXED_SIZE = 22
+
+        def find_first_signature(f, signature):
+            f.seek(0, os.SEEK_SET)
+            sig_len = len(signature)
+            overlap = sig_len - 1
+            offset = 0
+            tail = b""
+
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    return -1
+
+                data = tail + chunk
+                pos = data.find(signature)
+                if pos != -1:
+                    return offset - len(tail) + pos
+
+                tail = data[-overlap:] if len(data) >= overlap else data
+                offset += len(chunk)
+
+        def find_last_signature(f, signature):
+            f.seek(0, os.SEEK_SET)
+            sig_len = len(signature)
+            overlap = sig_len - 1
+            offset = 0
+            tail = b""
+            last_pos = -1
+
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    return last_pos
+
+                data = tail + chunk
+                search_from = 0
+
+                while True:
+                    pos = data.find(signature, search_from)
+                    if pos == -1:
+                        break
+                    last_pos = offset - len(tail) + pos
+                    search_from = pos + 1
+
+                tail = data[-overlap:] if len(data) >= overlap else data
+                offset += len(chunk)
+
+        def copy_range(src_path, dst_path, start, end):
+            remaining = end - start
+            with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
+                src.seek(start)
+                while remaining > 0:
+                    chunk = src.read(min(CHUNK_SIZE, remaining))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    remaining -= len(chunk)
+
+        with open(bin_path, "rb") as f:
+            zip_start = find_first_signature(f, ZIP_LOCAL_SIG)
+            if zip_start == -1:
+                self.log("no zip header found")
+                return None
+
+            eocd_pos = find_last_signature(f, ZIP_EOCD_SIG)
+            if eocd_pos == -1:
+                self.log("no eocd header found")
+                return None
+
+            f.seek(eocd_pos + 20)
+            comment_len_bytes = f.read(2)
+            if len(comment_len_bytes) != 2:
+                self.log("EOCD 不完整，无法读取 comment length")
+                raise RuntimeError("EOCD 不完整，无法读取 comment length")
+
+            comment_len = struct.unpack("<H", comment_len_bytes)[0]
+            zip_end = eocd_pos + EOCD_FIXED_SIZE + comment_len
+
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            if zip_end > file_size:
+                raise RuntimeError("计算出的 ZIP 结尾超出文件范围，文件可能损坏")
+
+
+        parent = os.path.dirname(output_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        copy_range(bin_path, output_path, zip_start, zip_end)
+        return output_path
+
+
 if __name__ == '__main__':
     api = StegoApi()
 
-    window = webview.create_window('PhantomMan MP4 Video Steganography Tool', 'gui.html', js_api=api, width=950, height=850)
+    window = webview.create_window('PhantomMan MP4 Video Steganography Tool v1.0.1.1', 'gui.html', js_api=api, width=950, height=850)
     api.set_window(window)
     webview.start()
