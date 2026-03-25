@@ -6,4 +6,6 @@ https://www.virustotal.com/gui/file/2bffaac3a3ce17851e03f5d5763ce755aa2f695476e1
 
 <h2>How to Use</h2>
 
-working......
+![屏幕截图 2026-03-25 135950](https://github.com/user-attachments/assets/76a1eedc-5035-462c-a9de-e5b1bf4e4d3a)
+
+![屏幕截图 2026-03-25 133602](https://github.com/user-attachments/assets/0c4c604e-1d44-40b3-9e3d-945c139ab847)
